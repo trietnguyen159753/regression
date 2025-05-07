@@ -1,144 +1,192 @@
+import pandas as pd
 import polars as pl
+from polars import selectors as ps
 import statsmodels.api as sm
+import os
 import numpy as np
-import warnings
+from matplotlib import pyplot as plt
+import datashader as ds
+import colorcet as cc
+from datashader import transfer_functions as tf
 
-# Suppress potential statsmodels warnings if desired
-warnings.filterwarnings("ignore", category=UserWarning)
+# Configuration
+CONFIG = {
+    'output_viz_dir': './analysis-constants/visualization/cooks-distance/',
+    'output_sum_dir': './analysis-constants/',
+    'data_file': './Constants_prelim.parquet',
+    'outlier_iqr_threshold': 10,
+    'output_variables': [
+        'Real GDP Growth', 'Inflation', 'Unemployment', 
+        'Budget Balance', 'Approval Index'
+    ],
+    'input_variables': [
+        'Interest Rate', 'Vat Rate', 'Corporate Tax',
+        'Government Expenditure', 'Import Tariff'
+    ]
+}
 
-# --- Configuration ---
-input_file = './data/constants.csv'
-output_file = './analysis-constants/regression_results.csv'
+def load_data():
+    """Load and clean initial data."""
+    df = pl.read_parquet(CONFIG['data_file'])
+    return df.with_columns(
+    pl.col(pl.Float64).replace([float('inf'), -float('inf')], None)
+    ).drop_nulls()
 
-group_cols = ['country', 'period']
-independent_vars = [
-    'Interest Rate',
-    'Vat Rate',
-    'Corporate Tax',
-    'Government Expenditure',
-    'Import Tariff'
-]
-dependent_vars = [
-    'Real GDP Growth',
-    'Inflation',
-    'Unemployment',
-    'Budget Balance',
-    'Approval Index'
-]
+def get_unique_combinations(df):
+    """Get unique country-period combinations."""
+    return df.select(['country', 'period']).unique().rows()
 
-# --- Data Loading ---
-print(f"Loading data from {input_file}...")
-df = pl.read_csv(input_file)
+def filter_outliers(df, variables, n_iqr=10):
+    """Remove outliers based on standard deviation."""
+    df_filtered = df.clone()
+    
+    # Create a combined filter expression
+    filter_expr = True
+    for variable in variables:
+        median = df[variable].median()
+        q1 = df[variable].quantile(0.25)
+        q3 = df[variable].quantile(0.75)
+        iqr = q3 - q1
+        
+        lower_bound = median - n_iqr * iqr
+        upper_bound = median + n_iqr * iqr
+        filter_expr = filter_expr & (
+            (pl.col(variable) >= lower_bound) & 
+            (pl.col(variable) <= upper_bound)
+        )
+    
+    return df_filtered.filter(filter_expr)
 
-# --- Data Preparation and Regression ---
-print("Starting regressions for each country/period group...")
-results_list = []
+def calculate_all_cooks_distances(df, input_vars, output_vars):
+    """Calculate Cook's distance for all output variables."""
+    X_pd = df.select(input_vars).to_pandas()
+    
+    cooks_distances = {}
+    for output_var in output_vars:
+        y_pd = df.select(output_var).to_pandas()
+        model = sm.OLS(y_pd, X_pd).fit()
+        cooks_distances[output_var] = model.get_influence().cooks_distance[0]
+    
+    return cooks_distances
+def plot_cooks_distance(cooks_d, output_var, country, period, out_dir, cutoff):
+    """Create and save a Cook's distance plot."""
+    # Create directory if it doesn't exist
+    os.makedirs(out_dir, exist_ok=True)
+    
+    # Setup plot data
+    plot_data = pd.DataFrame({
+        'index': range(len(cooks_d)),
+        'cooks_distance': cooks_d
+    })
+    
+    x_range_data = [0, len(cooks_d) - 1]
+    y_max = max(cooks_d) if len(cooks_d) > 0 else 0
+    y_range_data = [0, y_max * 1.1]
+    
+    # Create plot using datashader
+    canvas = ds.Canvas(plot_width=800, plot_height=500, x_range=x_range_data, y_range=y_range_data)
+    agg = canvas.points(plot_data, 'index', 'cooks_distance')
+    img = tf.shade(agg, cmap=cc.blues)
+    
+    # Add annotations with matplotlib
+    fig, ax = plt.subplots(figsize=(10, 6))
+    ax.imshow(img.to_pil(), extent=[x_range_data[0], x_range_data[1], y_range_data[0], y_range_data[1]], 
+              origin='upper', aspect='auto')
+    
+    ax.axhline(y=cutoff, color='red', linestyle='--', label=f'Cutoff: {cutoff:.4f}', alpha=0.5)
+    ax.grid(False)
+    ax.set_ylabel("Cook's Distance")
+    ax.set_xlim(x_range_data)
+    ax.set_ylim(y_range_data)
+    
+    # Save plot
+    plot_path = os.path.join(out_dir, f"{output_var}.png")
+    fig.savefig(plot_path, dpi=72, bbox_inches='tight', pad_inches=0.1)
+    plt.close(fig)
+    
+def process_country_period(df, country, period):
+    """Process a single country-period combination."""
+    print(f"Processing {country} - {period}")
+    
+    # Filter data for specific country and period
+    df_cp = df.filter((pl.col('country') == country) & (pl.col('period') == period))
+    initial_count = df_cp.shape[0]
+    
+    # Remove outliers
+    df_filtered = filter_outliers(df_cp, CONFIG['output_variables'], CONFIG['outlier_iqr_threshold'])
+    outlier_count = initial_count - df_filtered.shape[0]
+    print(f"Removed {outlier_count} extreme outliers from {initial_count} rows")
+    
+    # Calculate Cook's distances
+    cook_output_viz_dir = os.path.join(CONFIG['output_viz_dir'], country, str(period))
+    filtered_count = df_filtered.shape[0]
+    cooks_cutoff = 4 / filtered_count
+    
+    cooks_distances = calculate_all_cooks_distances(
+        df_filtered, 
+        CONFIG['input_variables'], 
+        CONFIG['output_variables']
+    )
+    
+    # Add Cook's distances to DataFrame and plot
+    for output_var, distances in cooks_distances.items():
+        df_filtered = df_filtered.with_columns(
+            pl.Series(f"cooks_{output_var}", distances).cast(pl.Float32)
+        )
+        # plot_cooks_distance(
+        #     distances, output_var, country, period, cook_output_viz_dir, cooks_cutoff
+        # )
+    
+    # Filter influential points
+    for output_var in CONFIG['output_variables']:
+        df_filtered = df_filtered.filter(pl.col(f"cooks_{output_var}") <= cooks_cutoff)
+    
+    print(f"Removed {filtered_count - df_filtered.shape[0]} influential points")
+    
+    # Fit final models and collect results
+    results = []
+    for output_var in CONFIG['output_variables']:
+        X = df_filtered.select(CONFIG['input_variables']).to_pandas()
+        X = sm.add_constant(X)
+        y = df_filtered.select(output_var).to_pandas()
+        
+        model = sm.OLS(y, X).fit()
+        
+        result = {
+            'country': country,
+            'period': period,
+            'output_variable': output_var,
+            'n_rows': df_filtered.shape[0],
+            'r_squared': model.rsquared,
+            'prob_f_stat': 0.0 if model.f_pvalue <= 1e-4 else model.f_pvalue,
+            'intercept_coef': model.params["const"],
+        }
+        
+        for i, input_var in enumerate(CONFIG['input_variables']):
+            idx = i + 1  # +1 to account for constant
+            result[f"{input_var}_coef"] = model.params.iloc[idx]
+            result[f"{input_var}_pvalue"] = 0.0 if model.pvalues.iloc[idx] <= 1e-4 else model.pvalues.iloc[idx]
+        
+        results.append(result)
+    
+    return pl.DataFrame(results)
 
-# Group by country and period
-# Use .iter_groups() for efficient iteration over subsets
-grouped = df.group_by(group_cols)
+def main():
+    # Load and prepare data
+    df = load_data()
+    
+    # Process each country-period combination
+    result_dfs = []
+    for country, period in get_unique_combinations(df):
+        result_df = process_country_period(df, country, period)
+        result_dfs.append(result_df)
+    
+    # Combine results
+    final_df = pl.concat(result_dfs, how="vertical")
+    final_df.sort(['country', 'period', 'output_variable']).write_csv(os.path.join(CONFIG['output_sum_dir'], "regression.csv"))
+    print(final_df)
+    
+    return final_df
 
-for (country, period), group_df in grouped:
-    print(f"Processing group: country={country}, period={period}")
-
-    # Get independent and dependent variable data for this group
-    try:
-        X_group_df = group_df.select(independent_vars)
-        Y_group_df = group_df.select(dependent_vars)
-
-        # Get sample size for this group
-        nobs = len(group_df)
-
-        # Convert independent variables to NumPy array and add constant for intercept
-        X_group_np = X_group_df.to_numpy()
-        X_group_np_with_const = sm.add_constant(X_group_np, has_constant='add') # Add a constant column
-
-        # Names for the columns in X_group_np_with_const
-        param_names = ['Intercept'] + independent_vars
-
-        # Perform regression for each dependent variable
-        for dep_var in dependent_vars:
-            y_group_np = Y_group_df.select(dep_var).to_numpy().flatten()
-
-            # Ensure no NaN/Inf values that would cause issues
-            if np.any(~np.isfinite(y_group_np)) or np.any(~np.isfinite(X_group_np_with_const)):
-                 print(f"  Skipping regression for {dep_var} in {country}-{period} due to non-finite values.")
-                 continue
-
-            try:
-                # Fit the OLS model
-                model = sm.OLS(y_group_np, X_group_np_with_const)
-                results = model.fit()
-
-                # --- Extract and structure results for this regression ---
-
-                # Parameters (Intercept and Coefficients)
-                for i, param_name in enumerate(param_names):
-                    results_list.append({
-                        'country': country,
-                        'period': period,
-                        'Dependent Variable': dep_var,
-                        'Independent Variables': param_name,
-                        'Result': results.params[i],
-                        'Significance Value': results.pvalues[i],
-                        'Sample Size': nobs
-                    })
-
-                # R-squared
-                results_list.append({
-                    'country': country,
-                    'period': period,
-                    'Dependent Variable': dep_var,
-                    'Independent Variables': 'R-squared',
-                    'Result': results.rsquared,
-                    'Significance Value': results.f_pvalue, # F-test p-value for overall model significance
-                    'Sample Size': nobs
-                })
-
-            except Exception as e:
-                print(f"  Error performing regression for {dep_var} in {country}-{period}: {e}")
-                # Optionally add a row indicating failure
-                results_list.append({
-                     'country': country,
-                     'period': period,
-                     'Dependent Variable': dep_var,
-                     'Independent Variables': 'Error',
-                     'Result': np.nan,
-                     'Significance Value': np.nan,
-                     'Sample Size': nobs # Still include sample size
-                })
-
-
-    except Exception as e:
-        print(f"Error processing data for group {country}-{period}: {e}")
-        # If data extraction fails, skip the group or add error indicator
-        # For simplicity, the inner loop handles errors per dependent variable
-
-
-# --- Consolidate and Export Results ---
-print("\nRegressions complete. Consolidating results...")
-
-if results_list:
-    # Create Polars DataFrame from the list of dictionaries
-    results_df = pl.DataFrame(results_list)
-
-    # Define schema explicitly for clarity and correctness
-    results_df = results_df.with_columns([
-        pl.col('country').cast(pl.Utf8),
-        pl.col('period').cast(pl.Int64), # Or Int32 depending on range
-        pl.col('Dependent Variable').cast(pl.Utf8),
-        pl.col('Independent Variables').cast(pl.Utf8),
-        pl.col('Result').cast(pl.Float64),
-        pl.col('Significance Value').cast(pl.Float64),
-        pl.col('Sample Size').cast(pl.Int64) # Or Int32
-    ])
-
-    # Write to CSV
-    print(f"Exporting results to {output_file}...")
-    try:
-        results_df.write_csv(output_file)
-        print("Results exported successfully.")
-    except Exception as e:
-        print(f"Error exporting results: {e}")
-else:
-    print("No results generated (possibly due to errors). No output file created.")
+if __name__ == "__main__":
+    main()
